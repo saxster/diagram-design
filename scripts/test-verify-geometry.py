@@ -381,6 +381,77 @@ def main() -> int:
         0,
     )
 
+    # Rule 5: solid connector transiting behind a non-endpoint stroked node is rejected,
+    # whereas a dashed unavoidable transit (`stroke-dasharray="4,3"`) or an enclosing zone is allowed.
+    check_message(
+        "solid connector transiting through non-endpoint node interior",
+        document(f'<line x1="40" y1="92" x2="320" y2="92" {arrow}/>' + stroked),
+        "transits behind non-endpoint node",
+    )
+    check(
+        "dashed connector transiting through non-endpoint node interior is legal",
+        document(
+            f'<line x1="40" y1="92" x2="320" y2="92" stroke-dasharray="4,3" {arrow}/>'
+            + stroked
+        ),
+        0,
+    )
+    check(
+        "connector inside an enclosing zone container is not a transit violation",
+        document(
+            '<rect x="20" y="20" width="340" height="160" rx="8" fill="#eee" stroke="#ccc"/>'
+            f'<line x1="60" y1="92" x2="300" y2="92" {arrow}/>'
+        ),
+        0,
+    )
+
+    # Rule 3 corridor: unrelated parallel connectors 4px apart over >=24px create a false-merge corridor.
+    check_message(
+        "unrelated parallel connectors 4px apart over 80px corridor",
+        document(
+            f'<path d="M 20,60 H 120" {arrow}/>'
+            f'<path d="M 20,64 H 120" {arrow}/>'
+        ),
+        "runs parallel within 4px",
+    )
+    check(
+        "unrelated parallel connectors 12px apart are legal",
+        document(
+            f'<path d="M 20,60 H 120" {arrow}/>'
+            f'<path d="M 20,72 H 120" {arrow}/>'
+        ),
+        0,
+    )
+
+    # Route rhythm: an interior orthogonal micro-jog (< 6px) between two straight segments is rejected.
+    check_message(
+        "connector with a 4px interior micro-jog",
+        document(f'<path d="M 20,60 H 80 V 64 H 160" {arrow}/>'),
+        "interior jog",
+    )
+    check(
+        "connector with a 16px interior step is legal",
+        document(f'<path d="M 20,60 H 80 V 76 H 160" {arrow}/>'),
+        0,
+    )
+
+    # Structured check_structured() and --json CLI receipt contract.
+    with tempfile.TemporaryDirectory() as scratch_json:
+        bad_html = Path(scratch_json) / "bad.html"
+        bad_html.write_text(
+            document(f'<path d="M 20,60 H 80 V 64 H 160" {arrow}/>'),
+            encoding="utf-8",
+        )
+        structured = getattr(module, "check_structured", lambda _: [])(bad_html)
+        if (
+            len(structured) != 1
+            or structured[0].get("code") != "geometry/connector-micro-jog"
+            or not structured[0].get("supportedFixes")
+        ):
+            failures.append(f"check_structured micro-jog receipt invalid: {structured}")
+        else:
+            print("OK: check_structured emits code, evidence, and supportedFixes")
+
     check_file("shipped architecture example", ARCHITECTURE, 0)
     check_file("shipped swimlane example", SWIMLANE, 0)
     check_file("shipped high-level example", HIGH_LEVEL, 0)

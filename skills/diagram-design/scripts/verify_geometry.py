@@ -58,10 +58,12 @@ From a repository checkout, `python3 scripts/verify-geometry.py` runs this file.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 ASSET_DIR = Path(__file__).resolve().parent.parent / "assets"
 
@@ -368,14 +370,10 @@ def shifted(segments: list[Segment], frame: Offset) -> list[Segment]:
     return [(kind, x1 + dx, y1 + dy, x2 + dx, y2 + dy) for kind, x1, y1, x2, y2 in segments]
 
 
-def connectors(source: str) -> list[tuple[int, str, list[Segment] | None]]:
-    """Return (line number, short label, segments) for every arrowed connector.
+def connector_records(source: str) -> list[tuple[int, str, list[Segment] | None, str]]:
+    """Return (line number, short label, segments, raw attrs) for every arrowed connector."""
 
-    Segments are None for a path the parser cannot read, so the caller can
-    fail closed instead of passing a connector nothing checked.
-    """
-
-    found: list[tuple[int, str, list[Segment] | None]] = []
+    found: list[tuple[int, str, list[Segment] | None, str]] = []
     for tag, attrs, start, frame in shapes(source):
         if tag == "rect" or frame is None:
             continue
@@ -396,10 +394,20 @@ def connectors(source: str) -> list[tuple[int, str, list[Segment] | None]]:
             segments = path_segments(d)
             label = f'<path d="{d if len(d) <= 48 else d[:45] + "..."}">'
         if segments is None:
-            found.append((line, label, None))
+            found.append((line, label, None, attrs))
         elif segments:
-            found.append((line, label, shifted(segments, frame)))
+            found.append((line, label, shifted(segments, frame), attrs))
     return found
+
+
+def connectors(source: str) -> list[tuple[int, str, list[Segment] | None]]:
+    """Return (line number, short label, segments) for every arrowed connector.
+
+    Segments are None for a path the parser cannot read, so the caller can
+    fail closed instead of passing a connector nothing checked.
+    """
+
+    return [(line, label, segments) for line, label, segments, _ in connector_records(source)]
 
 
 def stroked_nodes(source: str) -> list[Rect]:
@@ -469,25 +477,121 @@ def near_corner(px: float, py: float, node: Rect) -> tuple[float, float] | None:
     return None
 
 
-def check_connectors(path: Path, source: str) -> list[str]:
+CORRIDOR_MIN_GAP = 6.0  # parallel non-shared corridors closer than this visually merge
+CORRIDOR_MIN_RUN = 24.0  # minimum parallel overlap to count as a shared corridor
+MICRO_JOG_MIN = 6.0  # minimum interior orthogonal step between two straight turns
+
+
+def _diag(
+    code: str,
+    path: Path,
+    line: int,
+    message: str,
+    subject: dict[str, Any],
+    evidence: dict[str, Any],
+    fixes: list[str],
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "severity": "error",
+        "file": path.name,
+        "line": line,
+        "message": message,
+        "subject": subject,
+        "evidence": evidence,
+        "supportedFixes": fixes,
+    }
+
+
+def transits_node_interior(
+    segments: list[Segment],
+    ends: tuple[tuple[float, float], tuple[float, float]],
+    node: Rect,
+) -> bool:
+    if any(attached(px, py, node) for px, py in ends):
+        return False
+    # A container/zone box that encloses either endpoint is not a transited non-endpoint box.
+    if any(
+        node.x - PORT_TOLERANCE <= px <= node.right + PORT_TOLERANCE
+        and node.y - PORT_TOLERANCE <= py <= node.bottom + PORT_TOLERANCE
+        for px, py in ends
+    ):
+        return False
+    for kind, x1, y1, x2, y2 in segments:
+        if kind != "line":
+            continue
+        if abs(y1 - y2) <= AXIS_TOLERANCE and node.y + PORT_TOLERANCE < y1 < node.bottom - PORT_TOLERANCE:
+            low, high = sorted((x1, x2))
+            if low <= node.x + BORDER_TOLERANCE and high >= node.right - BORDER_TOLERANCE:
+                return True
+        if abs(x1 - x2) <= AXIS_TOLERANCE and node.x + PORT_TOLERANCE < x1 < node.right - PORT_TOLERANCE:
+            low, high = sorted((y1, y2))
+            if low <= node.y + BORDER_TOLERANCE and high >= node.bottom - BORDER_TOLERANCE:
+                return True
+    return False
+
+
+def find_micro_jog(segments: list[Segment]) -> tuple[float, float, float, float, float] | None:
+    if len(segments) < 3:
+        return None
+    for idx in range(1, len(segments) - 1):
+        prev_seg, curr_seg, next_seg = segments[idx - 1], segments[idx], segments[idx + 1]
+        if prev_seg[0] != "line" or curr_seg[0] != "line" or next_seg[0] != "line":
+            continue
+        _, x1, y1, x2, y2 = curr_seg
+        length = math.hypot(x2 - x1, y2 - y1)
+        if not (AXIS_TOLERANCE < length < MICRO_JOG_MIN):
+            continue
+        prev_h = abs(prev_seg[2] - prev_seg[4]) <= AXIS_TOLERANCE
+        curr_h = abs(y1 - y2) <= AXIS_TOLERANCE
+        next_h = abs(next_seg[2] - next_seg[4]) <= AXIS_TOLERANCE
+        if prev_h != curr_h and next_h != curr_h:
+            return length, x1, y1, x2, y2
+    return None
+
+
+def check_connectors_structured(path: Path, source: str) -> list[dict[str, Any]]:
     nodes = stroked_nodes(source)
-    findings: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
     ports: list[tuple[int, float, float, int, str, str, int]] = []
     parsed: list[tuple[int, str, list[Segment]]] = []
-    for ident, (line, label, segments) in enumerate(connectors(source)):
+    for ident, (line, label, segments, attrs) in enumerate(connector_records(source)):
         where = f"{path.name}:{line}: connector {label}"
+        subj = {"kind": "connector", "label": label, "line": line}
         if segments is None:
-            findings.append(
+            msg = (
                 f"{where} has path data the checker cannot parse"
                 f" - write it with absolute M/L/H/V/Q/C/A commands"
+            )
+            diagnostics.append(
+                _diag(
+                    "geometry/connector-unparseable",
+                    path,
+                    line,
+                    msg,
+                    subj,
+                    {"label": label},
+                    ["Rewrite the path d attribute using valid absolute M, L, H, V, Q, C, or A commands."],
+                )
             )
             continue
         parsed.append((line, label, segments))
         for kind, x1, y1, x2, y2 in segments:
             if kind == "line" and abs(x1 - x2) > AXIS_TOLERANCE and abs(y1 - y2) > AXIS_TOLERANCE:
-                findings.append(
+                msg = (
                     f"{where} has a diagonal segment {x1:g},{y1:g} -> {x2:g},{y2:g}"
                     f" - route it as a rounded right-angle elbow"
+                )
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-diagonal",
+                        path,
+                        line,
+                        msg,
+                        subj,
+                        {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                        [f"Replace diagonal {x1:g},{y1:g} -> {x2:g},{y2:g} with an orthogonal H/V or r=8 Q elbow."],
+                    )
                 )
                 break
         for segment in segments:
@@ -496,9 +600,20 @@ def check_connectors(path: Path, source: str) -> list[str]:
             hit = next(((node, side) for node in nodes if (side := rides_border(segment, node))), None)
             if hit:
                 node, side = hit
-                findings.append(
+                msg = (
                     f"{where} runs along the {side} border of node {node} (line {node.line})"
                     f" - leave the node perpendicular to the edge the port sits on"
+                )
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-border-ride",
+                        path,
+                        line,
+                        msg,
+                        subj,
+                        {"side": side, "node": repr(node), "nodeLine": node.line},
+                        [f"Depart perpendicular to the {side} edge of node at line {node.line} before turning."],
+                    )
                 )
                 break
         ends = ((segments[0][1], segments[0][2]), (segments[-1][3], segments[-1][4]))
@@ -506,19 +621,78 @@ def check_connectors(path: Path, source: str) -> list[str]:
             corner = next(((node, c) for node in nodes if (c := near_corner(px, py, node))), None)
             if corner:
                 node, (cx, cy) = corner
-                findings.append(
+                msg = (
                     f"{where} attaches at {px:g},{py:g}, within {CORNER_CLEARANCE:g}px of the"
                     f" {cx:g},{cy:g} corner of node {node} (line {node.line})"
                     f" - move the port onto the straight part of the edge"
                 )
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-corner-port",
+                        path,
+                        line,
+                        msg,
+                        subj,
+                        {"px": px, "py": py, "cornerX": cx, "cornerY": cy, "clearance": CORNER_CLEARANCE, "nodeLine": node.line},
+                        [f"Shift port {px:g},{py:g} at least {CORNER_CLEARANCE:g}px inward from corner {cx:g},{cy:g}."],
+                    )
+                )
                 break
+        dash = (attribute(attrs, "stroke-dasharray") or "").strip()
+        if not dash:
+            transit_node = next(
+                (node for node in nodes if transits_node_interior(segments, ends, node)),
+                None,
+            )
+            if transit_node is not None:
+                msg = (
+                    f"{where} transits behind non-endpoint node {transit_node} (line {transit_node.line})"
+                    f" with a solid stroke - reroute around the box or use dashed stroke-dasharray=\"4,3\""
+                )
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-solid-transit",
+                        path,
+                        line,
+                        msg,
+                        subj,
+                        {"node": repr(transit_node), "nodeLine": transit_node.line},
+                        [
+                            f"Reroute connector around node {transit_node} (line {transit_node.line}).",
+                            'Add stroke-dasharray="4,3" if transiting behind the box is geometrically unavoidable.',
+                        ],
+                    )
+                )
+        jog = find_micro_jog(segments)
+        if jog is not None:
+            jlen, jx1, jy1, jx2, jy2 = jog
+            msg = (
+                f"{where} has a {jlen:g}px interior jog at {jx1:g},{jy1:g} -> {jx2:g},{jy2:g}"
+                f" - align the ports or widen the turn to at least {MICRO_JOG_MIN:g}px"
+            )
+            diagnostics.append(
+                _diag(
+                    "geometry/connector-micro-jog",
+                    path,
+                    line,
+                    msg,
+                    subj,
+                    {"length": jlen, "x1": jx1, "y1": jy1, "x2": jx2, "y2": jy2, "minimum": MICRO_JOG_MIN},
+                    [f"Align endpoints to remove the {jlen:g}px jog or widen the step to >= {MICRO_JOG_MIN:g}px."],
+                )
+            )
         for (px, py), role in zip(ends, ("start", "end")):
             for index, node in enumerate(nodes):
                 if attached(px, py, node):
                     ports.append((index, px, py, line, label, role, ident))
-    findings.extend(shared_ports(path, nodes, ports))
-    findings.extend(stacked_connectors(path, parsed))
-    return findings
+    diagnostics.extend(shared_ports_structured(path, nodes, ports))
+    diagnostics.extend(stacked_connectors_structured(path, parsed))
+    diagnostics.extend(parallel_corridors_structured(path, parsed))
+    return diagnostics
+
+
+def check_connectors(path: Path, source: str) -> list[str]:
+    return [d["message"] for d in check_connectors_structured(path, source)]
 
 
 STACK_TOLERANCE = 1.0  # strokes this close are drawn on top of each other
@@ -586,35 +760,99 @@ def shared_run(a: list[Segment], b: list[Segment]) -> float:
     return longest * SAMPLE_STEP
 
 
+def stacked_connectors_structured(
+    path: Path, parsed: list[tuple[int, str, list[Segment]]]
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for i, (line_a, label_a, segments_a) in enumerate(parsed):
+        for line_b, label_b, segments_b in parsed[i + 1 :]:
+            shared = max(shared_run(segments_a, segments_b), shared_run(segments_b, segments_a))
+            if shared > BORDER_MIN_RUN:
+                msg = (
+                    f"{path.name}:{line_b}: connector {label_b} runs on top of {label_a}"
+                    f" (line {line_a}) for about {shared:g}px - offset one route by at least"
+                    f" {SHARED_PORT_MIN:g}px so each arrow stays traceable"
+                )
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-stacked-trunk",
+                        path,
+                        line_b,
+                        msg,
+                        {"kind": "connector", "label": label_b, "line": line_b},
+                        {"otherLine": line_a, "otherLabel": label_a, "sharedPx": shared, "minimumOffset": SHARED_PORT_MIN},
+                        [f"Offset connector at line {line_b} by at least {SHARED_PORT_MIN:g}px from line {line_a}."],
+                    )
+                )
+    return diagnostics
+
+
 def stacked_connectors(
     path: Path, parsed: list[tuple[int, str, list[Segment]]]
 ) -> list[str]:
     """Report two connectors drawn on top of each other (primitives-core rule 3)."""
 
-    findings: list[str] = []
+    return [d["message"] for d in stacked_connectors_structured(path, parsed)]
+
+
+def parallel_corridors_structured(
+    path: Path, parsed: list[tuple[int, str, list[Segment]]]
+) -> list[dict[str, Any]]:
+    """Report unrelated parallel connectors running 1..6px apart for >=24px (rule 3 corridor)."""
+
+    diagnostics: list[dict[str, Any]] = []
     for i, (line_a, label_a, segments_a) in enumerate(parsed):
+        ends_a = ((segments_a[0][1], segments_a[0][2]), (segments_a[-1][3], segments_a[-1][4]))
         for line_b, label_b, segments_b in parsed[i + 1 :]:
-            shared = max(shared_run(segments_a, segments_b), shared_run(segments_b, segments_a))
-            if shared > BORDER_MIN_RUN:
-                findings.append(
-                    f"{path.name}:{line_b}: connector {label_b} runs on top of {label_a}"
-                    f" (line {line_a}) for about {shared:g}px - offset one route by at least"
-                    f" {SHARED_PORT_MIN:g}px so each arrow stays traceable"
+            ends_b = ((segments_b[0][1], segments_b[0][2]), (segments_b[-1][3], segments_b[-1][4]))
+            if any(math.dist(pa, pb) <= STACK_TOLERANCE for pa in ends_a for pb in ends_b):
+                continue
+            hit: tuple[float, float] | None = None
+            for kind_a, x1a, y1a, x2a, y2a in segments_a:
+                if kind_a != "line":
+                    continue
+                for kind_b, x1b, y1b, x2b, y2b in segments_b:
+                    if kind_b != "line":
+                        continue
+                    if abs(y1a - y2a) <= AXIS_TOLERANCE and abs(y1b - y2b) <= AXIS_TOLERANCE:
+                        gap = abs(y1a - y1b)
+                        shared = min(max(x1a, x2a), max(x1b, x2b)) - max(min(x1a, x2a), min(x1b, x2b))
+                        if STACK_TOLERANCE < gap < CORRIDOR_MIN_GAP and shared >= CORRIDOR_MIN_RUN:
+                            hit = (gap, shared)
+                            break
+                    if abs(x1a - x2a) <= AXIS_TOLERANCE and abs(x1b - x2b) <= AXIS_TOLERANCE:
+                        gap = abs(x1a - x1b)
+                        shared = min(max(y1a, y2a), max(y1b, y2b)) - max(min(y1a, y2a), min(y1b, y2b))
+                        if STACK_TOLERANCE < gap < CORRIDOR_MIN_GAP and shared >= CORRIDOR_MIN_RUN:
+                            hit = (gap, shared)
+                            break
+                if hit is not None:
+                    break
+            if hit is not None:
+                gap, shared = hit
+                msg = (
+                    f"{path.name}:{line_b}: connector {label_b} runs parallel within {gap:g}px"
+                    f" of {label_a} (line {line_a}) for {shared:g}px - separate parallel"
+                    f" corridors by at least {SHARED_PORT_MIN:g}px"
                 )
-    return findings
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-parallel-corridor",
+                        path,
+                        line_b,
+                        msg,
+                        {"kind": "connector", "label": label_b, "line": line_b},
+                        {"otherLine": line_a, "otherLabel": label_a, "gapPx": gap, "sharedPx": shared, "minimumGap": SHARED_PORT_MIN},
+                        [f"Separate parallel corridor at line {line_b} from line {line_a} by at least {SHARED_PORT_MIN:g}px."],
+                    )
+                )
+    return diagnostics
 
 
-def shared_ports(
+def shared_ports_structured(
     path: Path, nodes: list[Rect], ports: list[tuple[int, float, float, int, str, str, int]]
-) -> list[str]:
-    """Report two connectors leaving, or two arriving, at one point on a node.
-
-    A head-to-tail joint, where one arrow lands and the next leaves, is a chain
-    the reader traces in order (Medallion's documented promotion joints), so it
-    is not reported. Two starts are a fork and two ends are a merge.
-    """
-
-    findings: list[str] = []
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
     for i, (node_a, ax, ay, line_a, label_a, role_a, id_a) in enumerate(ports):
         for node_b, bx, by, line_b, label_b, role_b, id_b in ports[i + 1 :]:
             if node_a != node_b or id_a == id_b or role_a != role_b:
@@ -627,15 +865,39 @@ def shared_ports(
             minimum = SMALL_PORT_MIN if length < SMALL_EDGE else SHARED_PORT_MIN
             gap = abs(along_a - along_b)
             if gap < minimum:
-                findings.append(
+                msg = (
                     f"{path.name}:{line_b}: connector {label_b} attaches {gap:g}px from"
                     f" {label_a} (line {line_a}) on the {side_a} edge of node {node}"
                     f" (line {node.line}) - fan the ports at least {minimum:g}px apart"
                 )
-    return findings
+                diagnostics.append(
+                    _diag(
+                        "geometry/connector-shared-port",
+                        path,
+                        line_b,
+                        msg,
+                        {"kind": "connector", "label": label_b, "line": line_b},
+                        {"otherLine": line_a, "side": side_a, "gapPx": gap, "minimumPx": minimum, "nodeLine": node.line},
+                        [f"Fan port at line {line_b} along the {side_a} edge by at least {minimum:g}px."],
+                    )
+                )
+    return diagnostics
 
 
-def check(path: Path) -> list[str]:
+def shared_ports(
+    path: Path, nodes: list[Rect], ports: list[tuple[int, float, float, int, str, str, int]]
+) -> list[str]:
+    """Report two connectors leaving, or two arriving, at one point on a node.
+
+    A head-to-tail joint, where one arrow lands and the next leaves, is a chain
+    the reader traces in order (Medallion's documented promotion joints), so it
+    is not reported. Two starts are a fork and two ends are a merge.
+    """
+
+    return [d["message"] for d in shared_ports_structured(path, nodes, ports)]
+
+
+def check_structured(path: Path) -> list[dict[str, Any]]:
     source = path.read_text(encoding="utf-8")
     rects = parse_rects(source)
     nodes = [r for r in rects if r.w >= NODE_MIN_W and r.h >= NODE_MIN_H]
@@ -645,7 +907,7 @@ def check(path: Path) -> list[str]:
         if MASK_MIN_W <= r.w <= MASK_MAX_W and MASK_MIN_H <= r.h <= MASK_MAX_H
     ]
 
-    findings: list[str] = []
+    diagnostics: list[dict[str, Any]] = []
     for mask in masks:
         for node in nodes:
             if node.offset <= mask.offset:
@@ -653,14 +915,34 @@ def check(path: Path) -> list[str]:
             dx, dy = overlap(mask, node)
             if dx <= 1.0 or dy <= 1.0 or contained(mask, node):
                 continue
-            findings.append(
+            msg = (
                 f"{path.name}:{mask.line}: label mask {mask} is clipped by node "
                 f"{node} declared later at line {node.line} (overlap {dx:g}x{dy:g}px)"
                 f" - move the label onto a free segment of its connector"
             )
+            diagnostics.append(
+                _diag(
+                    "geometry/mask-clipped",
+                    path,
+                    mask.line,
+                    msg,
+                    {"kind": "mask", "rect": repr(mask), "line": mask.line},
+                    {
+                        "mask": {"x": mask.x, "y": mask.y, "w": mask.w, "h": mask.h},
+                        "node": {"x": node.x, "y": node.y, "w": node.w, "h": node.h, "line": node.line},
+                        "overlapX": dx,
+                        "overlapY": dy,
+                    },
+                    [f"Move label mask at line {mask.line} clear of node {node} (line {node.line})."],
+                )
+            )
             break
-    findings.extend(check_connectors(path, source))
-    return findings
+    diagnostics.extend(check_connectors_structured(path, source))
+    return diagnostics
+
+
+def check(path: Path) -> list[str]:
+    return [d["message"] for d in check_structured(path)]
 
 
 def targets(args: argparse.Namespace) -> list[Path]:
@@ -673,11 +955,42 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("files", nargs="*", help="HTML diagrams to check")
     parser.add_argument("--all", action="store_true", help="check every shipped asset")
+    parser.add_argument("--json", action="store_true", help="emit structured JSON diagnostics receipt")
     args = parser.parse_args()
 
     paths = targets(args)
     if not paths:
         parser.error("pass one or more files, or --all")
+
+    if args.json:
+        diagnostics: list[dict[str, Any]] = []
+        for path in paths:
+            if not path.exists():
+                diagnostics.append(
+                    _diag(
+                        "input/not-found",
+                        path,
+                        1,
+                        f"{path}: file not found",
+                        {"kind": "file", "path": str(path)},
+                        {"path": str(path)},
+                        ["Pass an existing HTML diagram path."],
+                    )
+                )
+                continue
+            diagnostics.extend(check_structured(path))
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "filesChecked": len(paths),
+                    "findingCount": len(diagnostics),
+                    "diagnostics": diagnostics,
+                },
+                indent=2,
+            )
+        )
+        return 1 if diagnostics else 0
 
     findings: list[str] = []
     for path in paths:
