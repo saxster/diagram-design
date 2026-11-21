@@ -146,3 +146,10 @@ Every diagram is an accessible figure by default:
 4. `<title>` is the short name of the subject — roughly the page `<h1>`, and about 60 characters or fewer.
 5. `<desc>` is one sentence stating what the diagram shows in terms a reader needs without the image. Describe the content, not the geometry: “Org chart showing a command center routing work to specialist agents and escalation owners,” not “A box at the top with five boxes below it.” A shape-by-shape narration is worse than no useful description.
 6. Decorative-only SVG, such as the specimen glyphs in `assets/icons.html`, carries `aria-hidden="true"` instead.
+
+## Printer's Registration Plate & Stipple Layer Band
+
+When framing a single-ink schematic plate or distinguishing a background architectural stratum (substrate, transport plane, cache tier) without adding a heavy fill color:
+
+- **Registration crosshairs & dashed perimeter:** Use four `+` corner marks (`6px` arms, stroke `{ink @ 0.45}`, `stroke-linecap="square"`) paired with an optional dashed inset perimeter (`stroke="{ink @ 0.22}"`, `stroke-dasharray="3 3"`), wrapped in `<g aria-hidden="true">` so screen readers do not announce framing geometry.
+- **Monochrome dot-stipple pattern:** Define `<pattern id="<slug>-stipple" width="6" height="6" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r="0.8" fill="{ink @ 0.24}"/></pattern>` in `<defs>` and fill layer bands with `url(#<slug>-stipple)` plus a hairline `{ink @ 0.28}` border. Keep text inside stipple bands inside an opaque `{paper}` pill mask so label legibility exceeds `4.5:1`.
