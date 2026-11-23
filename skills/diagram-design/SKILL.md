@@ -302,7 +302,7 @@ Run before producing any diagram.
 - [ ] `viewBox` expanded for the legend strip (~60px)?
 - [ ] **`min-width` equals the viewBox width, and the SVG sits in a local `overflow-x: auto` wrapper? (Otherwise a phone scrolls the whole page — or an `overflow: hidden` ancestor clips the diagram with no scrollbar at all. See [output-spec.md](references/output-spec.md).)**
 - [ ] Node origins, dimensions, gaps, padding on the 4px grid; type sizes on the role ramp?
-- [ ] From the installed skill directory, did `python3 scripts/self_check.py <file>` pass? (Accessible-SVG contract, single-file safety, document completeness, content inside the viewBox, motion basics.)
+- [ ] From the installed skill directory, did `python3 scripts/self_check.py <file>` pass (including `--describe` / `--metrics` and zero placeholder leaks)? (Accessible-SVG contract, single-file safety, document completeness, content inside the viewBox, exact `fontTools` + budget text-fit checks, motion basics; or run `python3 scripts/describe_diagram.py <file> --check` to audit topology, labels, and `--expect` terms. For font-safe Keynote/PowerPoint/Figma SVG exports, use `python3 scripts/export_svg.py <file> --outline-text`.)
 - [ ] If animated, does the complete static/no-JS frame work, does reduced motion hide/disable playback, and is the controller copied verbatim from `assets/template-motion.html`? From a repository checkout, also run `python3 <repo-root>/scripts/verify-motion.py path/to/generated.html` plus the skin linter; from an installed skill, manually check print and static-query states on top of the self-check.
 
 **Typography:**

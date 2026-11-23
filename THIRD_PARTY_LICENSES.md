@@ -34,11 +34,17 @@ The MIT license is reproduced in full at https://github.com/log-z/logos/blob/mai
 
 The MIT license is reproduced in full at https://github.com/devicons/devicon/blob/master/LICENSE.
 
+## Geist and Geist Mono
+
+- **License:** SIL Open Font License 1.1
+- **Upstream:** https://github.com/vercel/geist-font
+- **Used in:** static font files (`Geist-Regular.ttf`, `Geist-Medium.ttf`, `Geist-SemiBold.ttf`, `GeistMono-Regular.ttf`, `GeistMono-Medium.ttf`, `GeistMono-Bold.ttf`) bundled in `skills/diagram-design/scripts/fonts/` for exact `fontTools` glyph-metric checks and `--outline-text` SVG export, alongside `OFL-Geist.txt` and `OFL-GeistMono.txt`.
+
 ## Instrument Serif
 
 - **License:** SIL Open Font License 1.1
 - **Upstream:** https://github.com/Instrument/instrument-serif
-- **Used in:** the plugin logo (`assets/logo.svg`, `assets/logo.png`, `assets/composer-icon.png`), which contains the outline of the lowercase "d" from Instrument Serif Italic. No font file is bundled.
+- **Used in:** the plugin logo (`assets/logo.svg`, `assets/logo.png`, `assets/composer-icon.png`), which contains the outline of the lowercase "d" from Instrument Serif Italic, and static font files (`InstrumentSerif-Regular.ttf`, `InstrumentSerif-Italic.ttf`) bundled in `skills/diagram-design/scripts/fonts/` alongside `OFL-InstrumentSerif.txt`.
 
 The license is reproduced in full at https://github.com/google/fonts/blob/main/ofl/instrumentserif/OFL.txt.
 

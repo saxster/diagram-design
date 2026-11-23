@@ -23,13 +23,30 @@ The algorithm matches ``references/export.md``. No third-party deps.
 from __future__ import annotations
 
 import argparse
-import math
 import html as html_entities
+import importlib.util
+import math
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
+
+
+def _load_sibling(name: str) -> Any:
+    key = f"_diagram_design_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    target = Path(__file__).resolve().parent / f"{name}.py"
+    if not target.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(key, target)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 GOOGLE_FONTS_IMPORT = (
     "@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1"
@@ -1505,6 +1522,611 @@ def normalize_rgba_presentation_attrs(svg: str) -> str:
     return _rewrite_start_tags(svg, normalize_tag)
 
 
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+_OUTLINE_INHERITED_PROPS = frozenset({
+    "color", "fill", "fill-opacity", "font-family", "font-size", "font-weight",
+    "font-style", "letter-spacing", "text-anchor", "dominant-baseline",
+    "text-transform", "direction", "writing-mode", "white-space",
+})
+_OUTLINE_STYLE_PROPS = _OUTLINE_INHERITED_PROPS | frozenset({"opacity", "stroke", "stroke-width"})
+_OUTLINE_SKIP_CONTAINERS = frozenset({"defs", "symbol", "marker", "pattern", "clippath", "mask"})
+_OUTLINE_KEEP_ATTRS = frozenset({
+    "id", "class", "transform", "opacity", "clip-path", "mask", "filter", "role", "tabindex",
+})
+_CSS_VAR_CALL_RE = re.compile(r"\bvar\(", re.IGNORECASE)
+_FONT_SIZE_TOKEN_RE = re.compile(r"^([+-]?(?:\d+\.?\d*|\.\d+))(px|pt|rem|em)?(?:/[^\s]+)?$", re.IGNORECASE)
+_WEIGHT_KEYWORDS = {
+    "normal", "bold", "bolder", "lighter",
+    "100", "200", "300", "400", "500", "600", "700", "800", "900",
+}
+_STYLE_KEYWORDS = {"italic", "oblique", "normal"}
+_RGB_COLOR_RE = re.compile(
+    r"^(rgba?)\(\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*,\s*([+-]?\d+)(?:\s*,\s*([+-]?\d*\.?\d+))?\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _local_tag(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _expand_font_shorthand(value: str) -> dict[str, str]:
+    """Expand CSS ``font`` shorthand into weight, style, size, and family."""
+    tokens: list[str] = []
+    pos = 0
+    quote = ""
+    buf: list[str] = []
+    while pos < len(value):
+        ch = value[pos]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch.isspace() and not quote:
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+        pos += 1
+    if buf:
+        tokens.append("".join(buf))
+
+    size_idx = -1
+    size_val = ""
+    for idx, tok in enumerate(tokens):
+        clean = tok.rstrip(",")
+        m = _FONT_SIZE_TOKEN_RE.match(clean)
+        if m and clean.lower() not in _WEIGHT_KEYWORDS:
+            size_idx = idx
+            num = float(m.group(1))
+            unit = (m.group(2) or "px").lower()
+            if unit == "pt":
+                num *= 4.0 / 3.0
+            elif unit in {"rem", "em"}:
+                num *= 16.0
+            size_val = f"{num:g}px"
+            break
+    if size_idx < 0:
+        return {}
+    out: dict[str, str] = {"font-size": size_val}
+    for prefix_tok in tokens[:size_idx]:
+        low = prefix_tok.lower()
+        if low in {"italic", "oblique"}:
+            out["font-style"] = low
+        elif low in _WEIGHT_KEYWORDS and low != "normal":
+            out["font-weight"] = low
+    family = " ".join(tokens[size_idx + 1 :]).strip()
+    if family:
+        out["font-family"] = family
+    return out
+
+
+def _parse_css_declarations(body: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Return ``(custom_vars, style_props)`` from a CSS declaration block."""
+    custom_vars: dict[str, str] = {}
+    props: dict[str, str] = {}
+    for segment in _css_segments(body, ";"):
+        parts = _css_segments(segment, ":")
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip().casefold()
+        raw_val = ":".join(parts[1:]).strip()
+        val = re.sub(r"\s*!important\s*$", "", raw_val, flags=re.IGNORECASE).strip()
+        if not val:
+            continue
+        if name.startswith("--"):
+            custom_vars[name] = val
+        elif name == "font":
+            props.update(_expand_font_shorthand(val))
+        elif name in _OUTLINE_STYLE_PROPS:
+            props[name] = val
+    return custom_vars, props
+
+
+def _resolve_css_vars(value: str, custom_vars: dict[str, str], depth: int = 0) -> str:
+    """Resolve CSS ``var(--name[, fallback])`` expressions up to depth 8."""
+    if depth >= 8 or "var(" not in value.casefold():
+        return value
+    out: list[str] = []
+    pos = 0
+    while pos < len(value):
+        match = _CSS_VAR_CALL_RE.search(value, pos)
+        if match is None:
+            out.append(value[pos:])
+            break
+        out.append(value[pos:match.start()])
+        idx = match.end()
+        parens = 1
+        quote = ""
+        while idx < len(value) and parens > 0:
+            ch = value[idx]
+            if quote:
+                if ch == quote:
+                    quote = ""
+            elif ch in "\"'":
+                quote = ch
+            elif ch == "(":
+                parens += 1
+            elif ch == ")":
+                parens -= 1
+                if parens == 0:
+                    break
+            idx += 1
+        if parens != 0:
+            out.append(value[match.start():])
+            break
+        inner = value[match.end():idx]
+        args = _css_segments(inner, ",")
+        var_name = args[0].strip().casefold()
+        fallback = ",".join(args[1:]).strip() if len(args) > 1 else ""
+        if var_name in custom_vars:
+            resolved = _resolve_css_vars(custom_vars[var_name], custom_vars, depth + 1)
+        elif fallback:
+            resolved = _resolve_css_vars(fallback, custom_vars, depth + 1)
+        else:
+            resolved = ""
+        out.append(resolved)
+        pos = idx + 1
+    return "".join(out)
+
+
+def _split_selector_tokens(branch: str) -> list[str] | None:
+    """Split a CSS selector branch into compounds and combinators (' ' or '>')."""
+    if ":" in branch:
+        # Ignore pseudo-class/pseudo-element rules (:hover, :focus-visible, ::before).
+        return None
+    normalized = re.sub(r"\s*>\s*", " > ", branch.strip())
+    parts = [part for part in normalized.split() if part]
+    if not parts or any(op in parts for op in ("+", "~")):
+        return None
+    if ".motion-ready" in normalized:
+        return None
+    return parts
+
+
+def _compound_matches(compound: str, elem: ET.Element) -> tuple[bool, tuple[int, int, int]]:
+    """Check simple compound (tag, .class, #id) against an element and return specificity."""
+    if not compound:
+        return False, (0, 0, 0)
+    if compound == "*":
+        return True, (0, 0, 0)
+    pos = 0
+    tag_name = ""
+    if compound[0] not in ".#[":
+        m = re.match(r"^[A-Za-z_][\w-]*", compound)
+        if not m:
+            return False, (0, 0, 0)
+        tag_name = m.group(0).casefold()
+        pos = m.end()
+    req_ids: list[str] = []
+    req_classes: list[str] = []
+    while pos < len(compound):
+        ch = compound[pos]
+        if ch in ".#":
+            m = re.match(r"^[A-Za-z_][\w-]*", compound[pos + 1 :])
+            if not m:
+                return False, (0, 0, 0)
+            ident = m.group(0)
+            (req_classes if ch == "." else req_ids).append(ident)
+            pos += 1 + m.end()
+        elif ch == "[":
+            end = compound.find("]", pos + 1)
+            if end < 0:
+                return False, (0, 0, 0)
+            inner = compound[pos + 1 : end].strip()
+            attr_name, sep, attr_val = inner.partition("=")
+            key = attr_name.strip().casefold()
+            if key not in elem.attrib:
+                return False, (0, 0, 0)
+            if sep and elem.attrib[key] != attr_val.strip().strip("\"'"):
+                return False, (0, 0, 0)
+            req_classes.append(inner)  # attribute selector carries class-level specificity
+            pos = end + 1
+        else:
+            return False, (0, 0, 0)
+
+    if tag_name and _local_tag(elem.tag).casefold() != tag_name:
+        return False, (0, 0, 0)
+    if req_ids and elem.attrib.get("id", "") not in req_ids:
+        return False, (0, 0, 0)
+    if any(eid != elem.attrib.get("id", "") for eid in req_ids):
+        return False, (0, 0, 0)
+    elem_classes = set(elem.attrib.get("class", "").split())
+    if not set(req_classes) <= elem_classes and "[" not in compound:
+        return False, (0, 0, 0)
+    if "[" in compound:
+        plain_classes = set(re.findall(r"\.([A-Za-z_][\w-]*)", compound))
+        if not plain_classes <= elem_classes:
+            return False, (0, 0, 0)
+    return True, (len(req_ids), len(req_classes), 1 if tag_name else 0)
+
+
+def _selector_matches(tokens: list[str], ancestry: list[ET.Element]) -> tuple[int, int, int] | None:
+    """Match a tokenized selector right-to-left against ``ancestry``."""
+    matched, spec = _compound_matches(tokens[-1], ancestry[-1])
+    if not matched:
+        return None
+    total_spec = spec
+    elem_idx = len(ancestry) - 2
+    tok_idx = len(tokens) - 2
+    while tok_idx >= 0:
+        if tokens[tok_idx] == ">":
+            tok_idx -= 1
+            if elem_idx < 0 or tok_idx < 0:
+                return None
+            ok, part_spec = _compound_matches(tokens[tok_idx], ancestry[elem_idx])
+            if not ok:
+                return None
+            total_spec = (
+                total_spec[0] + part_spec[0],
+                total_spec[1] + part_spec[1],
+                total_spec[2] + part_spec[2],
+            )
+            elem_idx -= 1
+            tok_idx -= 1
+        else:
+            found = False
+            while elem_idx >= 0:
+                ok, part_spec = _compound_matches(tokens[tok_idx], ancestry[elem_idx])
+                elem_idx -= 1
+                if ok:
+                    total_spec = (
+                        total_spec[0] + part_spec[0],
+                        total_spec[1] + part_spec[1],
+                        total_spec[2] + part_spec[2],
+                    )
+                    found = True
+                    break
+            if not found:
+                return None
+            tok_idx -= 1
+    return total_spec
+
+
+def _strip_at_imports(css: str) -> str:
+    """Remove top-level @import statements without breaking on semicolons inside url(...)."""
+    kept: list[str] = []
+    for segment in _css_segments(css, ";"):
+        if re.match(r"^\s*@import\b", segment, re.IGNORECASE):
+            continue
+        kept.append(segment)
+    return ";".join(kept).lstrip("; \t\r\n")
+
+
+def _extract_outline_css(root: ET.Element) -> tuple[dict[str, str], list[tuple[list[str], dict[str, str], int]]]:
+    """Collect custom properties and static style rules from embedded SVG <style> blocks."""
+    custom_vars: dict[str, str] = {}
+    parsed_rules: list[tuple[list[str], dict[str, str], int]] = []
+    order = 0
+
+    def walk_css_rules(nodes: list[_CssRule]) -> None:
+        nonlocal order
+        for rule in nodes:
+            if rule.statement:
+                continue
+            sel = rule.selector.strip()
+            low_sel = sel.casefold()
+            if rule.group:
+                if "print" in low_sel or "prefers-reduced-motion" in low_sel:
+                    continue
+                walk_css_rules(rule.children)
+                continue
+            if sel.startswith("@"):
+                continue
+            body = rule.css[rule.start:rule.end]
+            cv, props = _parse_css_declarations(body)
+            if cv:
+                custom_vars.update(cv)
+            if not props:
+                continue
+            for branch in selector_list_parts(sel):
+                tokens = _split_selector_tokens(branch)
+                if tokens:
+                    parsed_rules.append((tokens, props, order))
+                    order += 1
+
+    for elem in root.iter():
+        if _local_tag(elem.tag).casefold() == "style" and elem.text:
+            css = strip_css_comments(_strip_at_imports(elem.text))
+            try:
+                walk_css_rules(_css_rule_tree(css))
+            except ValueError:
+                continue
+    return custom_vars, parsed_rules
+
+
+def _compute_element_style(
+    elem: ET.Element,
+    ancestry: list[ET.Element],
+    parent_style: dict[str, str],
+    custom_vars: dict[str, str],
+    rules: list[tuple[list[str], dict[str, str], int]],
+) -> dict[str, str]:
+    """Compute cascaded style properties for ``elem``."""
+    resolved = {k: v for k, v in parent_style.items() if k in _OUTLINE_INHERITED_PROPS}
+    for prop in _OUTLINE_STYLE_PROPS:
+        if prop in elem.attrib and elem.attrib[prop].strip():
+            resolved[prop] = elem.attrib[prop].strip()
+
+    matched: list[tuple[tuple[int, int, int], int, dict[str, str]]] = []
+    for tokens, props, order in rules:
+        spec = _selector_matches(tokens, ancestry)
+        if spec is not None:
+            matched.append((spec, order, props))
+    matched.sort(key=lambda item: (item[0], item[1]))
+    for _, _, props in matched:
+        resolved.update(props)
+
+    inline = elem.attrib.get("style", "")
+    if inline:
+        inline_vars, inline_props = _parse_css_declarations(inline)
+        if inline_vars:
+            custom_vars = {**custom_vars, **inline_vars}
+        resolved.update(inline_props)
+
+    return {k: _resolve_css_vars(v, custom_vars) for k, v in resolved.items()}
+
+
+def _parse_svg_number(value: str | None) -> float | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", cleaned):
+        num = float(cleaned)
+        return num if math.isfinite(num) else None
+    return None
+
+
+def _parse_font_size(value: str | None) -> float | None:
+    if not value:
+        return None
+    m = re.fullmatch(r"\s*([+-]?(?:\d+\.?\d*|\.\d+))(px|pt|rem|em)?\s*", value, re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1))
+    unit = (m.group(2) or "px").lower()
+    if unit == "pt":
+        num *= 4.0 / 3.0
+    elif unit in {"rem", "em"}:
+        num *= 16.0
+    return num if num > 0 and math.isfinite(num) else None
+
+
+def _normalize_outline_paint(style: dict[str, str]) -> dict[str, str]:
+    """Resolve fill/opacity/stroke into strict SVG 1.1 presentation attributes."""
+    out: dict[str, str] = {}
+    fill = style.get("fill", "#000000").strip()
+    fill_opacity_str = style.get("fill-opacity", "").strip()
+    fill_opacity = _parse_svg_number(fill_opacity_str) if fill_opacity_str else None
+    if fill.casefold() == "currentcolor":
+        fill = style.get("color", "#000000").strip() or "#000000"
+    if fill.casefold() == "transparent":
+        fill = "none"
+    rgb_match = _RGB_COLOR_RE.fullmatch(fill)
+    if rgb_match:
+        r, g, b = (max(0, min(255, int(rgb_match.group(i)))) for i in (2, 3, 4))
+        fill = f"#{r:02x}{g:02x}{b:02x}"
+        alpha_raw = rgb_match.group(5)
+        if alpha_raw is not None:
+            alpha = max(0.0, min(1.0, float(alpha_raw)))
+            fill_opacity = alpha if fill_opacity is None else max(0.0, min(1.0, fill_opacity * alpha))
+    out["fill"] = fill or "#000000"
+    if fill_opacity is not None and fill_opacity < 1.0:
+        out["fill-opacity"] = f"{fill_opacity:.12g}"
+    if style.get("stroke") and style["stroke"].strip().casefold() not in {"", "none"}:
+        out["stroke"] = style["stroke"].strip()
+        if style.get("stroke-width"):
+            out["stroke-width"] = style["stroke-width"].strip()
+    return out
+
+
+def _outline_single_text(
+    elem: ET.Element,
+    ancestry: list[ET.Element],
+    parent_style: dict[str, str],
+    custom_vars: dict[str, str],
+    rules: list[tuple[list[str], dict[str, str], int]],
+    fm: Any,
+) -> ET.Element | None:
+    """Convert one <text> element into a <g data-outlined-text="true"> or return None to keep."""
+    if any(_local_tag(c.tag).casefold() == "textpath" for c in elem):
+        return None
+    if any(attr in elem.attrib for attr in ("dx", "dy", "rotate", "textLength")):
+        return None
+    if elem.attrib.get("{http://www.w3.org/XML/1998/namespace}space") == "preserve":
+        return None
+
+    tstyle = _compute_element_style(elem, ancestry, parent_style, custom_vars, rules)
+    if tstyle.get("direction", "").strip().casefold() == "rtl":
+        return None
+    if tstyle.get("writing-mode", "").strip().casefold() not in {"", "lr-tb", "horizontal-tb"}:
+        return None
+    if tstyle.get("white-space", "").strip().casefold() in {"pre", "pre-wrap", "break-spaces"}:
+        return None
+
+    x0 = _parse_svg_number(elem.attrib.get("x", "0"))
+    y0 = _parse_svg_number(elem.attrib.get("y", "0"))
+    if x0 is None or y0 is None:
+        return None
+
+    lines: list[dict[str, Any]] = [{"x": x0, "y": y0, "anchor": tstyle.get("text-anchor", "start").strip().casefold(), "runs": []}]
+    if elem.text:
+        lines[-1]["runs"].append((elem.text, tstyle))
+
+    for child in elem:
+        if _local_tag(child.tag).casefold() != "tspan":
+            return None
+        if any(attr in child.attrib for attr in ("dx", "rotate", "textLength")):
+            return None
+        cstyle = _compute_element_style(child, ancestry + [child], tstyle, custom_vars, rules)
+        if "x" in child.attrib:
+            cx = _parse_svg_number(child.attrib["x"])
+            if cx is None:
+                return None
+            if "y" in child.attrib:
+                cy = _parse_svg_number(child.attrib["y"])
+            elif "dy" in child.attrib:
+                dy = _parse_svg_number(child.attrib["dy"])
+                cy = None if dy is None else lines[-1]["y"] + dy
+            else:
+                cy = lines[-1]["y"]
+            if cy is None:
+                return None
+            anchor = cstyle.get("text-anchor", tstyle.get("text-anchor", "start")).strip().casefold()
+            lines.append({"x": cx, "y": cy, "anchor": anchor, "runs": []})
+        elif "y" in child.attrib or "dy" in child.attrib:
+            return None
+        if child.text:
+            lines[-1]["runs"].append((child.text, cstyle))
+        if child.tail:
+            lines[-1]["runs"].append((child.tail, tstyle))
+
+    # Normalize SVG whitespace and build outline runs.
+    path_specs: list[tuple[str, dict[str, str]]] = []
+    full_lines: list[str] = []
+    for line in lines:
+        norm_runs: list[tuple[str, dict[str, str]]] = []
+        for raw, rstyle in line["runs"]:
+            collapsed = re.sub(r"\s+", " ", raw)
+            if collapsed:
+                norm_runs.append((collapsed, rstyle))
+        if not norm_runs:
+            continue
+        norm_runs[0] = (norm_runs[0][0].lstrip(), norm_runs[0][1])
+        norm_runs[-1] = (norm_runs[-1][0].rstrip(), norm_runs[-1][1])
+        norm_runs = [(txt, st) for txt, st in norm_runs if txt]
+        if not norm_runs:
+            continue
+
+        resolved_runs = []
+        for txt, rstyle in norm_runs:
+            transformed = fm.apply_text_transform(txt, rstyle.get("text-transform"))
+            size = _parse_font_size(rstyle.get("font-size"))
+            if size is None:
+                return None
+            tracking = fm.parse_letter_spacing(rstyle.get("letter-spacing"), size)
+            if tracking is None:
+                return None
+            face = fm.resolve_face(
+                rstyle.get("font-family", ""),
+                rstyle.get("font-weight"),
+                rstyle.get("font-style"),
+            )
+            if face is None or not face.can_render(transformed):
+                return None
+            width = face.measure(transformed, size, tracking, trailing_tracking=False)
+            if width is None:
+                return None
+            shift = face.baseline_shift(size, rstyle.get("dominant-baseline", "auto"))
+            resolved_runs.append((transformed, rstyle, face, size, tracking, width, shift))
+
+        line_w = sum(item[5] for item in resolved_runs)
+        anchor = line["anchor"]
+        cursor_x = (
+            line["x"] - line_w / 2.0
+            if anchor == "middle"
+            else line["x"] - line_w
+            if anchor == "end"
+            else line["x"]
+        )
+        line_text_parts: list[str] = []
+        for transformed, rstyle, face, size, tracking, width, shift in resolved_runs:
+            line_text_parts.append(transformed)
+            d = face.outline(transformed, size, cursor_x, line["y"] + shift, tracking)
+            cursor_x += width
+            if d:
+                paint = _normalize_outline_paint(rstyle)
+                path_specs.append((d, paint))
+        full_lines.append("".join(line_text_parts))
+
+    if not path_specs:
+        return None
+
+    group = ET.Element(f"{{{SVG_NS}}}g")
+    for k, v in elem.attrib.items():
+        local_k = _local_tag(k)
+        if local_k in _OUTLINE_KEEP_ATTRS or local_k.startswith(("data-", "aria-")):
+            group.set(k, v)
+    if "opacity" in tstyle and "opacity" not in group.attrib and tstyle["opacity"].strip():
+        group.set("opacity", tstyle["opacity"].strip())
+    group.set("data-outlined-text", "true")
+    group.set("data-text-pos", f"{fm.fmt_svg_num(x0)},{fm.fmt_svg_num(y0)}")
+    first_meta = resolved_runs[0]
+    if path_specs:
+        first_size = first_meta[3]
+        first_weight = fm.parse_weight(first_meta[1].get("font-weight"))
+        first_kind = fm.classify_family(first_meta[1].get("font-family", ""))
+        group.set("data-text-meta", f"{first_size:g};{first_weight};{first_kind}")
+    title_el = ET.SubElement(group, f"{{{SVG_NS}}}title")
+    title_el.text = " ".join(full_lines)
+    for d, paint in path_specs:
+        ET.SubElement(group, f"{{{SVG_NS}}}path", {"d": d, **paint})
+    return group
+
+
+def outline_svg_text(svg: str, *, system_fonts: bool = False) -> tuple[str, int, int]:
+    """Convert renderable <text> elements in standalone SVG into vector <path> outlines.
+
+    Returns ``(updated_svg, outlined_count, fallback_count)``. Any <text> element
+    with unmapped glyphs (e.g. CJK/Hangul or unsupported symbols) or unsupported
+    layout attributes is preserved intact as <text>.
+    """
+    fm = _load_sibling("font_metrics")
+    if fm is None or not fm.HAS_FONTTOOLS:
+        raise ValueError("--outline-text requires fontTools (pip install fonttools)")
+
+    ET.register_namespace("", SVG_NS)
+    ET.register_namespace("xlink", XLINK_NS)
+    root = ET.fromstring(svg)
+    custom_vars, rules = _extract_outline_css(root)
+    outlined_count = 0
+    fallback_count = 0
+
+    def walk(elem: ET.Element, ancestry: list[ET.Element], parent_style: dict[str, str]) -> None:
+        nonlocal outlined_count, fallback_count
+        elem_style = _compute_element_style(elem, ancestry, parent_style, custom_vars, rules)
+        for idx, child in enumerate(list(elem)):
+            tag = _local_tag(child.tag).casefold()
+            if tag in _OUTLINE_SKIP_CONTAINERS:
+                continue
+            if tag == "text":
+                replacement = _outline_single_text(
+                    child, ancestry + [child], elem_style, custom_vars, rules, fm
+                )
+                if replacement is not None:
+                    replacement.tail = child.tail
+                    elem[idx] = replacement
+                    outlined_count += 1
+                else:
+                    fallback_count += 1
+            else:
+                walk(child, ancestry + [child], elem_style)
+
+    walk(root, [root], {})
+
+    if outlined_count > 0 and fallback_count == 0 and not system_fonts:
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if _local_tag(child.tag).casefold() == "style" and child.text:
+                    kept_segments = [
+                        seg
+                        for seg in _css_segments(child.text, ";")
+                        if not re.match(r"^\s*@import\b.*fonts\.googleapis\.com", seg, re.IGNORECASE | re.DOTALL)
+                    ]
+                    stripped = ";".join(kept_segments).strip("; \t\r\n")
+                    if stripped:
+                        child.text = stripped
+                    else:
+                        parent.remove(child)
+
+    return ET.tostring(root, encoding="unicode"), outlined_count, fallback_count
+
+
 def has_diagram_stylesheet(svg: str) -> bool:
     """True when a <style> block contains CSS rules beyond the fonts @import."""
     for block in STYLE_BLOCK_RE.findall(svg):
@@ -1536,7 +2158,12 @@ def assert_export_gate(svg: str) -> None:
         )
 
 
-def export_svg_document(html: str, source_path: Path, system_fonts: bool = False) -> str:
+def export_svg_document(
+    html: str,
+    source_path: Path,
+    system_fonts: bool = False,
+    outline_text: bool = False,
+) -> str:
     """Transform source HTML into a standalone SVG document string."""
     slug = slug_for(source_path)
     root_id = f"{slug}-root"
@@ -1560,6 +2187,14 @@ def export_svg_document(html: str, source_path: Path, system_fonts: bool = False
     svg = namespace_defs_ids(svg, slug)
     svg = xml_safe_comments(svg)
     svg = normalize_rgba_presentation_attrs(svg)
+    if outline_text:
+        svg, _outlined, fallback_count = outline_svg_text(svg, system_fonts=system_fonts)
+        if fallback_count:
+            print(
+                f"note: kept {fallback_count} <text> element(s) as live text due to "
+                "unmapped glyphs or unsupported SVG text positioning",
+                file=sys.stderr,
+            )
     assert_export_gate(svg)
     document = '<?xml version="1.0" encoding="UTF-8"?>\n' + svg + "\n"
     # Catch any remaining XML-breaking characters in carried content.
@@ -1586,6 +2221,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="omit the Google Fonts @import so the SVG makes no network request",
     )
+    parser.add_argument(
+        "--outline-text",
+        action="store_true",
+        help="convert SVG <text> labels into vector <path> outlines using bundled fonts",
+    )
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="also print a plain-text semantic summary of the exported SVG",
+    )
     args = parser.parse_args(argv)
 
     source: Path = args.source
@@ -1602,7 +2247,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         html = source.read_text(encoding="utf-8")
-        document = export_svg_document(html, source, system_fonts=args.system_fonts)
+        document = export_svg_document(
+            html,
+            source,
+            system_fonts=args.system_fonts,
+            outline_text=args.outline_text,
+        )
     except RecursionError:
         print("error: diagram CSS nesting exceeds the supported export depth", file=sys.stderr)
         return 2
@@ -1617,6 +2267,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot write {output}: {exc}", file=sys.stderr)
         return 2
     print(output)
+    if args.describe:
+        dd = _load_sibling("describe_diagram")
+        if dd is not None:
+            print(dd.format_summary(dd.describe_document(document)))
     return 0
 
 

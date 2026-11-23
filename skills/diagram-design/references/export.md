@@ -31,10 +31,14 @@ If the user explicitly asks for "a screenshot of the whole page including the ca
 **Prefer the packaged helper.** From this skill's directory run:
 
 ```
-python3 scripts/export_svg.py <html-file> [<out.svg>] [--system-fonts]
+python3 scripts/export_svg.py <html-file> [<out.svg>] [--system-fonts] [--outline-text] [--describe]
 ```
 
 `--system-fonts` skips the Google Fonts `@import` and carried `@font-face` declarations (step 5) so the SVG makes no network request; use it when the skin's font source is `system` (see [style-guide.md § Font source](style-guide.md#font-source)). The diagram CSS still carries over.
+
+`--outline-text` converts supported SVG `<text>` elements into vector `<path>` outlines using the bundled static SIL OFL fonts (`Geist`, `Geist Mono`, `Instrument Serif` in `scripts/fonts/`) via `fontTools` (`scripts/font_metrics.py`) so the SVG renders identically in Keynote, PowerPoint, Figma, and offline viewers with zero font substitution. Each outlined `<g data-outlined-text="true">` retains its `<title>` for accessibility and `scripts/describe_diagram.py`. Labels with unmapped glyphs (for example CJK, Hangul, Cyrillic, or symbols outside the bundled Latin fonts) or unsupported SVG positioning (`dx`, `rotate` attributes, `textPath`, RTL) automatically stay as live `<text>` so no glyph is ever dropped or replaced with a fallback box. When every `<text>` label outlines cleanly, the Google Fonts `@import` is omitted so the exported SVG makes zero network requests.
+
+`--describe` prints a plain-text semantic summary (title, description, zones, nodes, connections, and labels) via `scripts/describe_diagram.py` after writing the SVG.
 
 Source read and output write failures return exit 2 with an error diagnostic. The viewport must contain four finite SVG numbers with positive width and height; empty or disabled viewports are refused. The class-without-style gate inspects nonempty actual `class` attributes; comments, visible text, empty class values, and `data-class` metadata do not require a stylesheet. Export selects a live SVG and carries live style blocks; HTML comments and script literals do not contribute diagrams or CSS. The selected SVG ends at its own closing tag, so nested icon `<svg>` elements stay inside it. Comments inside the selected SVG remain intact, except that XML forbids `--` inside a comment and a comment ending in `-`: each `--` becomes `- -` and a trailing `-` gets a space. That script is the source of truth for the transform below (CSS carry-forward, defs ID namespacing, rgba normalization, and the class-without-style gate). Reimplement only when the helper is unavailable; keep the behaviour identical.
 
@@ -283,7 +287,7 @@ Numeric character references in text and attributes follow HTML decoding, includ
 
 ### Caveat to surface to the user
 
-Tools that don't fetch remote fonts at import time (offline Illustrator, some Figma import paths, older SVG viewers) will substitute typography. The SVG renders correctly in any modern browser. For pixel-perfect portability, recommend the PNG export.
+Tools that don't fetch remote fonts at import time (PowerPoint, Keynote, offline Illustrator, some Figma import paths, older SVG viewers) will substitute typography on plain `<text>` SVGs. Export with `--outline-text` for font-independent vector portability in slides and docs (requiring `fontTools`), or recommend the PNG export for pixel-perfect raster portability.
 
 ## PNG export procedure
 

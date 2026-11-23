@@ -470,6 +470,64 @@ def main() -> int:
     else:
         print("OK: offline mode passes a file without the font link")
 
+    # Exact fontTools metrics, placeholders, and --expect checks.
+    wide_html = fit_svg(
+        box + '<text x="4" y="32" font-size="12" font-family="\'Geist\', sans-serif" font-weight="600">WWWWWWWWWW</text>'
+    )
+    wide_budget_errors: list[str] = []
+    module.check_text_fit(wide_html, wide_budget_errors, metrics="budget")
+    if wide_budget_errors:
+        failures.append(f"wide glyphs budget-only should pass, got {wide_budget_errors}")
+    else:
+        print("OK: wide glyphs pass budget-only mode")
+    for mode in ("auto", "exact"):
+        wide_exact_errors: list[str] = []
+        module.check_text_fit(wide_html, wide_exact_errors, metrics=mode)
+        if not any("overflows its 100px box" in err for err in wide_exact_errors):
+            failures.append(f"wide glyphs in {mode} mode should overflow, got {wide_exact_errors}")
+        else:
+            print(f"OK: wide glyphs overflow caught in {mode} mode")
+
+    narrow_html = fit_svg(
+        box + '<text x="4" y="32" font-size="12" font-family="\'Geist\', sans-serif">iiiiiiiiiiiiiiiiiiii</text>'
+    )
+    narrow_exact_errors: list[str] = []
+    module.check_text_fit(narrow_html, narrow_exact_errors, metrics="exact")
+    if narrow_exact_errors:
+        failures.append(f"narrow glyphs exact-only should pass, got {narrow_exact_errors}")
+    else:
+        print("OK: narrow glyphs pass exact-only mode")
+    narrow_budget_errors: list[str] = []
+    module.check_text_fit(narrow_html, narrow_budget_errors, metrics="budget")
+    if not any("overflows its 100px box" in err for err in narrow_budget_errors):
+        failures.append(f"narrow glyphs budget-only should overflow, got {narrow_budget_errors}")
+    else:
+        print("OK: narrow glyphs fail budget-only mode as expected")
+
+    w400 = module.exact_text_run_width("MMMMMMMMMM", {"font-size": "12", "font-family": "Geist", "font-weight": "400"})
+    w600 = module.exact_text_run_width("MMMMMMMMMM", {"font-size": "12", "font-family": "Geist", "font-weight": "600"})
+    if not (w400 and w600 and w600[0] > w400[0]):
+        failures.append(f"expected Geist 600 to measure wider than Geist 400: {w400} vs {w600}")
+    else:
+        print("OK: font-weight affects exact Geist width")
+
+    for bad_label in ("TODO service", "TBD endpoint", "Lorem ipsum", "{{component_name}}"):
+        check_fail(
+            f"placeholder {bad_label!r}",
+            static.replace(">Reader</text>", f">{bad_label}</text>", 1),
+            "placeholder text",
+        )
+
+    if module.verify(STATIC_EXAMPLE, expect=("Cloudflare", "Astro Origin")):
+        failures.append("expect present terms should pass")
+    else:
+        print("OK: --expect passes when terms exist")
+    miss_errors = module.verify(STATIC_EXAMPLE, expect=("MissingKafkaTopic",))
+    if not any("MissingKafkaTopic" in err for err in miss_errors):
+        failures.append(f"--expect missing term should fail, got {miss_errors}")
+    else:
+        print("OK: --expect fails on missing term")
+
     if failures:
         for failure in failures:
             print(f"FAIL: {failure}")

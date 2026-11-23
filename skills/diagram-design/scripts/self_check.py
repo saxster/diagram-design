@@ -20,17 +20,34 @@ remain the authority for contributions to the repository itself.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import sys
 import unicodedata
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 from urllib.parse import urlparse
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 MOTION_TEMPLATE = SKILL_DIR / "assets" / "template-motion.html"
+
+
+def _load_sibling(name: str):
+    key = f"_diagram_design_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    target = Path(__file__).resolve().parent / f"{name}.py"
+    if not target.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(key, target)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
 MODES = {"none", "reveal", "step", "loop"}
 ACTIONS = {"play", "pause", "replay", "prev", "next"}
 ASCII_DECIMAL_RE = re.compile(r"^[0-9]+$")
@@ -70,6 +87,8 @@ SANS_ADVANCE = 0.60
 MONO_ADVANCE = 0.62
 WIDE_ADVANCE = 1.0
 TEXT_FIT_PROPERTIES = ("font-size", "font-family", "text-anchor", "letter-spacing")
+# Metric hints improve fontTools face resolution without changing CSS opt-out rules.
+TEXT_METRIC_HINTS = ("font-weight", "font-style", "text-transform")
 # Weight and style move real glyph widths, but the budget already averages over them.
 TEXT_FIT_IGNORED = {"font-weight", "font-style"}
 PAINT_PROPERTIES = frozenset({"fill", "stroke", "stroke-width", "fill-opacity", "stroke-opacity", "opacity"})
@@ -79,6 +98,8 @@ TEXT_LAYOUT_PROPERTIES = ("direction", "unicode-bidi", "writing-mode", "white-sp
 # sans, 0.60em mono drawn), so a smaller overshoot is budget error on a label that
 # draws inside its box; a whole character past the edge is the real defect.
 TEXT_FIT_TOLERANCE_EM = 0.3
+EXACT_FIT_TOLERANCE_PX = 0.5
+METRICS_MODES = ("auto", "exact", "budget")
 SVG_NUMBER = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 SVG_NUMBER_RE = re.compile(SVG_NUMBER)
 SVG_PLAIN_NUMBER_RE = re.compile(rf"^\s*{SVG_NUMBER}\s*$")
@@ -735,12 +756,17 @@ def inline_paint(attrs: dict[str, str]) -> dict[str, str]:
 
 def inline_text_style(attrs: dict[str, str]) -> dict[str, str]:
     values = {name: attrs[name] for name in TEXT_FIT_PROPERTIES if name in attrs}
+    for name in TEXT_METRIC_HINTS:
+        if attrs.get(name, "").strip():
+            values[name] = attrs[name].strip()
     values.update({name: "" for name in TEXT_LAYOUT_PROPERTIES if name in attrs})
     for declaration in attrs.get("style", "").split(";"):
         name, _, value = declaration.partition(":")
         name = name.strip().casefold()
         if restyles_text_width(name):
             values[name] = value.strip() if name in TEXT_FIT_PROPERTIES else ""
+        elif name in TEXT_METRIC_HINTS and value.strip():
+            values[name] = value.strip()
     return values
 
 
@@ -785,6 +811,37 @@ def text_advance(text: str, mono: bool) -> float:
 def font_size_px(style: dict[str, str]) -> float | None:
     match = re.fullmatch(rf"\s*({SVG_NUMBER})\s*(?:px)?\s*", style.get("font-size", ""))
     return float(match.group(1)) if match else None
+
+
+def exact_text_run_width(text: str, style: dict[str, str]) -> tuple[float, str] | None:
+    """Exact fontTools width in px and face label, or None if unavailable/unreadable."""
+    fm = _load_sibling("font_metrics")
+    if fm is None or not fm.HAS_FONTTOOLS:
+        return None
+    size = font_size_px(style)
+    if size is None:
+        return None
+    tracking = fm.parse_letter_spacing(style.get("letter-spacing"), size)
+    if tracking is None:
+        return None
+    face = fm.resolve_face(
+        style.get("font-family", ""),
+        style.get("font-weight"),
+        style.get("font-style"),
+    )
+    if face is None:
+        return None
+    rendered = fm.apply_text_transform(text, style.get("text-transform"))
+    mono = "mono" in style.get("font-family", "").casefold()
+    narrow = MONO_ADVANCE if mono else SANS_ADVANCE
+    width, _all_mapped = face.measure_mixed(
+        rendered,
+        size,
+        tracking,
+        fallback_narrow_em=narrow,
+        fallback_wide_em=WIDE_ADVANCE,
+    )
+    return width, face.label
 
 
 def text_run_width(text: str, style: dict[str, str]) -> float | None:
@@ -958,15 +1015,26 @@ def rect_area(rect: tuple) -> float:
     return (rect[2] - rect[0]) * (rect[3] - rect[1])
 
 
-def check_text_fit(source: str, errors: list[str]) -> None:
-    """Flag text whose budgeted width runs past the rect it sits in.
+def _box_overshoot(left: float, right: float, x: float, width: float, anchor: str) -> float:
+    start = x - width / 2 if anchor == "middle" else x - width if anchor == "end" else x
+    return max(left - start, start + width - right)
 
-    A line's box is the smallest rect painted before it that contains the line's
-    anchor point; a rect whose opacity, fill and stroke draw nothing is no box.
-    Text with no such rect (a free label, a caption), text on a paper-coloured
-    mask, bidi, vertical or space-preserving text, and text whose size, spacing,
-    layout or position CSS can change are not checked.
+
+def check_text_fit(source: str, errors: list[str], metrics: str = "auto") -> None:
+    """Flag text whose measured or budgeted width runs past the rect it sits in.
+
+    ``metrics`` selects ``'auto'`` (exact fontTools glyph metrics plus fallback
+    width-budget envelope, the default), ``'exact'`` (fontTools glyph metrics
+    only), or ``'budget'`` (0.60em sans / 0.62em mono budget only).
     """
+    if metrics not in METRICS_MODES:
+        raise ValueError(f"unsupported metrics mode {metrics!r}; choose from {METRICS_MODES}")
+    if metrics == "exact":
+        fm = _load_sibling("font_metrics")
+        if fm is None or not fm.HAS_FONTTOOLS:
+            errors.append("metrics='exact' requires fontTools (pip install fonttools)")
+            return
+
     parser = TextFitParser(source)
     parser.feed(source)
     parser.close()
@@ -987,7 +1055,7 @@ def check_text_fit(source: str, errors: list[str]) -> None:
             widths = [text_run_width(run, style) for run, style in runs]
             if any(width is None for width in widths):
                 continue
-            width = sum(widths)
+            budget_width = sum(widths)  # type: ignore[arg-type]
             size = max(font_size_px(style) or 0.0 for _run, style in runs)
             x, y = line["x"], line["y"]
             behind = [
@@ -1009,12 +1077,31 @@ def check_text_fit(source: str, errors: list[str]) -> None:
                 continue
             left, right = box[0], box[2]
             anchor = line["anchor"]
-            start = x - width / 2 if anchor == "middle" else x - width if anchor == "end" else x
-            overshoot = max(left - start, start + width - right)
+
+            if metrics in {"auto", "exact"}:
+                exact_runs = [exact_text_run_width(run, style) for run, style in runs]
+                if all(item is not None for item in exact_runs):
+                    exact_width = sum(item[0] for item in exact_runs if item is not None)
+                    face_label = next(
+                        (item[1] for item in exact_runs if item is not None), "font"
+                    )
+                    exact_overshoot = _box_overshoot(left, right, x, exact_width, anchor)
+                    if exact_overshoot > EXACT_FIT_TOLERANCE_PX:
+                        errors.append(
+                            f"svg {number}: text {text.strip()!r} at ({x:g}, {y:g}) measures "
+                            f"{exact_width:.1f}px in {face_label} and overflows its "
+                            f"{right - left:g}px box by {exact_overshoot:.1f}px; "
+                            "widen the box or shorten the label"
+                        )
+                        continue
+                if metrics == "exact":
+                    continue
+
+            overshoot = _box_overshoot(left, right, x, budget_width, anchor)
             if overshoot > TEXT_FIT_TOLERANCE_EM * size:
                 errors.append(
                     f"svg {number}: text {text.strip()!r} at ({x:g}, {y:g}) is budgeted at "
-                    f"{width:.0f}px and overflows its {right - left:g}px box by {overshoot:.0f}px; "
+                    f"{budget_width:.0f}px and overflows its {right - left:g}px box by {overshoot:.0f}px; "
                     "widen the box or shorten the label (budget: 0.60em sans, 0.62em mono per char)"
                 )
 
@@ -1125,7 +1212,12 @@ def check_motion(parser: DiagramParser, source: str, errors: list[str]) -> None:
             errors.append("motion file needs a <noscript> explanation of the complete static frame")
 
 
-def verify(path: Path, offline: bool = False) -> list[str]:
+def verify(
+    path: Path,
+    offline: bool = False,
+    metrics: str = "auto",
+    expect: Sequence[str] = (),
+) -> list[str]:
     source = path.read_text(encoding="utf-8")
     parser = parsed_document(source)
     errors: list[str] = []
@@ -1142,9 +1234,14 @@ def verify(path: Path, offline: bool = False) -> list[str]:
             )
     check_svgs(parser, errors)
     check_viewbox(source, errors)
-    check_text_fit(source, errors)
+    check_text_fit(source, errors, metrics=metrics)
     check_scripts(parser, errors)
     check_motion(parser, source, errors)
+    dd = _load_sibling("describe_diagram")
+    if dd is not None:
+        dd.check_placeholders(source, errors)
+        if expect:
+            dd.check_expected_terms(dd.describe_document(source), expect, errors)
     return errors
 
 
@@ -1156,11 +1253,35 @@ def main() -> int:
         action="store_true",
         help="also fail on the Google Fonts link, for system-font output that makes no network requests",
     )
+    argument_parser.add_argument(
+        "--metrics",
+        choices=METRICS_MODES,
+        default="auto",
+        help="text-fit mode: auto (exact fontTools + budget envelope), exact, or budget",
+    )
+    argument_parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="print a plain-text semantic summary of each diagram after checking",
+    )
+    argument_parser.add_argument(
+        "--expect",
+        action="append",
+        default=[],
+        metavar="TERM",
+        help="require TERM (case-insensitive) in diagram text, title, or desc (repeatable)",
+    )
     args = argument_parser.parse_args()
+    dd = _load_sibling("describe_diagram") if args.describe else None
     failed = False
     for path in args.files:
         try:
-            errors = verify(path, offline=args.offline)
+            errors = verify(
+                path,
+                offline=args.offline,
+                metrics=args.metrics,
+                expect=args.expect,
+            )
         except (OSError, UnicodeError) as exc:
             errors = [str(exc)]
         if errors:
@@ -1170,6 +1291,12 @@ def main() -> int:
                 print(f"  - {error}")
         else:
             print(f"OK {path}")
+        if args.describe and dd is not None and path.is_file():
+            try:
+                summary = dd.describe_document(path.read_text(encoding="utf-8"))
+                print(dd.format_summary(summary))
+            except (OSError, UnicodeError):
+                pass
     return 1 if failed else 0
 
 
